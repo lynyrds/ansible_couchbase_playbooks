@@ -1,0 +1,60 @@
+- hosts: all
+  become: True
+  become_user: root
+  max_fail_percentage: 0
+  serial: 1
+  # Include whatever is needed 
+  #vars_files:
+  #  - file1 
+
+  pre_tasks:
+    - name: "Check if we have any updates"
+      command: yum -q list updates warn=False
+      failed_when: False
+      register: gotupdates
+      tags: check_updates
+
+    - name: "Check if all nodes are happy"
+      raw: "/opt/couchbase/bin/couchbase-cli server-list -c localhost -u {{ user }} -p {{ password }} | grep -v 'healthy active'"
+      failed_when: False
+      register: nothappy
+      tags: check_happy
+
+    - name: "Fail if not all nodes are healthy and happy"
+      fail: msg="{{ nothappy.stdout_lines }}"
+      when: nothappy.rc != 1
+      tags: check_happy
+
+    - block:
+      - name: "Gracefully fail over a node"
+        shell: /opt/couchbase/bin/couchbase-cli failover --server-failover={{ ansible_fqdn }} -c localhost -u {{ password }} -p {{ password }}
+        tags: cb_failover
+
+      - name: "Readd a node"
+        shell: /opt/couchbase/bin/couchbase-cli server-readd --server-add={{ ansible_fqdn }} -c localhost -u {{ user }} -p {{ password }}
+        tags: cb_readd
+
+      - name: "Set recovery type to full"
+        shell: /opt/couchbase/bin/couchbase-cli recovery --server-recovery={{ ansible_fqdn }} --recovery-type=full -c localhost -u {{ user }} -p {{ password }}
+        tags: cb_set_recovery
+
+      - name: "Kill Couchbase PIDs"
+        raw: "sleep 5 && sudo /usr/bin/killall -9 -u couchbase"
+        failed_when: False
+        tags: kill_cb
+
+      - name: "Remove Couchbase PID file"
+        file: path=/opt/couchbase/var/lib/couchbase/couchbase-server.pid state=absent
+        tags: remove_cb_pid
+
+      when: "gotupdates.stdout_lines != [] and gotupdates.rc == 0"
+
+  roles:
+    # Patch role just takes care of patching of everything and rebooting of the node if needed
+    # Just add other roles, if needed
+    - { role: patch, when: "gotupdates.stdout_lines != [] and gotupdates.rc == 0" }
+
+  post_tasks:
+    - name: "Rebalance the cluster"
+      shell: /opt/couchbase/bin/couchbase-cli rebalance  -c localhost -u {{ user }} -p {{ password }}
+      tags: cb_rebalance
